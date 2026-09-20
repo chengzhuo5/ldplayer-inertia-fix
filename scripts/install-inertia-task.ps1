@@ -31,6 +31,7 @@ param(
     [ValidateSet('auto', 'exe', 'ps')][string]$Engine = 'auto',
     [switch]$CursorLock,
     [switch]$ClipDebug,
+    [switch]$FgWatch,
     [switch]$Remove,
     [switch]$Status
 )
@@ -139,6 +140,7 @@ if ($useExe) {
     $extra = ''
     if ($CursorLock) { $extra += ' --cursorlock' }
     if ($ClipDebug)  { $extra += ' --clipdebug' }
+    if ($FgWatch)    { $extra += ' --fgwatch' }
     $argLine = "--longpress $LongPressMs --shortdec $ShortDec --resetafter 1500 --log `"$ExeLog`"$extra"
     $action  = New-ScheduledTaskAction -Execute $Exe -Argument $argLine
     Write-Host ("engine: exe (event driven, WH_MOUSE_LL){0}" -f $(if ($CursorLock) { ' + cursor-lock watchdog' } else { '' })) -ForegroundColor Cyan
