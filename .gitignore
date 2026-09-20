@@ -1,0 +1,14 @@
+# build output (compile with scripts/build.ps1)
+scripts/inertia-native.exe
+
+# runtime logs / self-test dumps
+scripts/*.log
+scripts/selftest.txt
+*.elev.log
+
+# backups made by patch-inertia-dll.ps1
+scripts/backup/
+
+# OS noise
+Thumbs.db
+desktop.ini
