@@ -97,6 +97,8 @@ static class InertiaNative
     [DllImport("user32.dll")]
     static extern bool SetProcessDPIAware();
 
+    [DllImport("kernel32.dll")]
+    static extern uint GetTickCount();
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     static extern IntPtr GetModuleHandle(string lpModuleName);
 
@@ -537,38 +539,41 @@ static class InertiaNative
     static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
         long t0 = Stopwatch.GetTimestamp();
+        if (nCode < 0)
+        {
+            // documented: pass straight through, never inspect
+            return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+        }
         try
         {
-            if (nCode >= 0)
+            int msg = wParam.ToInt32();
+            if (gProbe)
             {
-                int msg = wParam.ToInt32();
-                if (gProbe)
+                // Prove the hook is live without touching any button state:
+                // log whatever comes through (mouse moves included) and bail out.
+                gProbeCount++;
+                LogAsync(string.Format("PROBE event #{0} msg=0x{1:X4}", gProbeCount, msg));
+                if (gProbeCount >= 6) { gStop = true; PostQuit(); }
+            }
+            else if (msg == WM_RBUTTONDOWN)
+            {
+                gDown = true; gDownAt = DateTime.UtcNow; gNeedReset = false;
+                if (!gLogOnly) WriteVariant(gRest, "on-down");
+                if (gVerbose) LogAsync("RBUTTON DOWN");
+                NoteLatency(lParam, "down");
+            }
+            else if (msg == WM_RBUTTONUP)
+            {
+                double held = (DateTime.UtcNow - gDownAt).TotalMilliseconds;
+                gDown = false; gUpAt = DateTime.UtcNow;
+                bool isLong = held >= gLongPress;
+                if (!gLogOnly)
                 {
-                    // Prove the hook is live without touching any button state:
-                    // log whatever comes through (mouse moves included) and bail out.
-                    gProbeCount++;
-                    LogAsync(string.Format("PROBE event #{0} msg=0x{1:X4}", gProbeCount, msg));
-                    if (gProbeCount >= 6) { gStop = true; PostQuit(); }
-                    return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+                    if (isLong) { WriteVariant(gZero, "on-up-long"); gNeedReset = true; }
+                    else { WriteVariant(gRest, "on-up-short"); gNeedReset = false; }
                 }
-                if (msg == WM_RBUTTONDOWN)
-                {
-                    gDown = true; gDownAt = DateTime.UtcNow; gNeedReset = false;
-                    if (!gLogOnly) WriteVariant(gRest, "on-down");
-                    if (gVerbose) LogAsync("RBUTTON DOWN");
-                }
-                else if (msg == WM_RBUTTONUP)
-                {
-                    double held = (DateTime.UtcNow - gDownAt).TotalMilliseconds;
-                    gDown = false; gUpAt = DateTime.UtcNow;
-                    bool isLong = held >= gLongPress;
-                    if (!gLogOnly)
-                    {
-                        if (isLong) { WriteVariant(gZero, "on-up-long"); gNeedReset = true; }
-                        else { WriteVariant(gRest, "on-up-short"); gNeedReset = false; }
-                    }
-                    LogAsync(string.Format("RBUTTON UP   held={0:N0}ms  -> {1}", held, isLong ? "ZERO (kill glide)" : "REST (keep glide)"));
-                }
+                LogAsync(string.Format("RBUTTON UP   held={0:N0}ms  -> {1}", held, isLong ? "ZERO (kill glide)" : "REST (keep glide)"));
+                NoteLatency(lParam, "up");
             }
         }
         catch { }
@@ -578,7 +583,14 @@ static class InertiaNative
         double ms = (Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency;
         if (ms > 50) LogAsync(string.Format("SLOW hook callback: {0:N1}ms (input stalls; Windows drops hooks past ~300ms)", ms));
 
-        return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+        CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+
+        // ALWAYS return 0.  For a low-level hook a NON-ZERO return value tells
+        // Windows to swallow the event - the target window never sees it.  Our
+        // old code forwarded whatever CallNextHookEx returned, so a non-zero
+        // value from any other hook in the chain would have eaten mouse input
+        // outright ("clicks reach the hook but never reach the game").
+        return IntPtr.Zero;
     }
 
     static void MaybeReset()
@@ -587,6 +599,20 @@ static class InertiaNative
         if ((DateTime.UtcNow - gUpAt).TotalMilliseconds < gResetAfter) return;
         WriteVariant(gRest, "reset");
         gNeedReset = false;
+    }
+
+    // Did Windows hand us this event promptly?  MSLLHOOKSTRUCT.time is the tick
+    // at which the event happened; a big gap means OUR thread was blocked, which
+    // stalls input for every app.  Only measured on button events (cheap).
+    static void NoteLatency(IntPtr lParam, string what)
+    {
+        try
+        {
+            MSLLHOOKSTRUCT hs = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
+            uint lat = GetTickCount() - hs.time;
+            if (lat > 100) LogAsync(string.Format("LATE input ({0}): delivered {1}ms late - our thread was blocking", what, lat));
+        }
+        catch { }
     }
 
     // ---------------- cursor lock watchdog ----------------
