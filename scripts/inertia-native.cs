@@ -146,6 +146,11 @@ static class InertiaNative
     static DateTime gDnPidAt = DateTime.MinValue;
     static RECT gLastLoggedClip;
     static int gLastLoggedFgPid = -1;
+    static DateTime gLeftDnAt = DateTime.MinValue;      // when the foreground last left dnplayer
+    static DateTime gLastReapply = DateTime.MinValue;
+    static int gReapplyCount = 0;
+    static double gAwayDebounceMs = 400;                // ignore shorter foreground flips
+    static double gReapplyCooldownSec = 5;              // never re-apply more often than this
 
     static byte[] gRest;      // quick-click encoding
     static byte[] gZero;      // long-press encoding
@@ -576,6 +581,12 @@ static class InertiaNative
         bool returning = fgIsDn && !gLastFgWasDn;
         bool lockedBefore = gWasLocked;
 
+        if (!fgIsDn) gLeftDnAt = DateTime.UtcNow;
+        // A genuine return needs the container to have been away for a while.
+        // Transient foreground flips (tooltips, IMEs, notifications) must NOT
+        // count, otherwise we churn ClipCursor and desync LDPlayer's own toggle.
+        bool realReturn = returning && (DateTime.UtcNow - gLeftDnAt).TotalMilliseconds >= gAwayDebounceMs;
+
         RECT clip;
         if (!GetClipCursor(out clip)) { gLastFgWasDn = fgIsDn; return; }
         bool clipped = IsClipped(clip);
@@ -615,13 +626,33 @@ static class InertiaNative
             gWasLocked = false;
         }
 
-        // THE FIX: coming back to the container with the lock still logically on,
-        // but the desktop clip gone -> put LDPlayer's own rect back.
-        if (returning && lockedBefore && !clipped && gHaveSavedClip)
+        // THE FIX - but only for a *genuine* return, at most once per return and
+        // at most once per cooldown.  This is deliberately timid: ClipCursor is a
+        // desktop-wide resource shared with LDPlayer, and over-eager re-applying
+        // desyncs LDPlayer's own lock toggle (that broke F8 once already).
+        if (realReturn && lockedBefore && !clipped && gHaveSavedClip)
         {
-            RECT r = gSavedClip;
-            if (ClipCursorRect(ref r)) Log("RE-APPLIED cursor lock " + RectStr(r) + " (clip had been stolen/released)");
-            else Log(string.Format("ClipCursor failed err={0}", Marshal.GetLastWin32Error()));
+            double sinceLast = (DateTime.UtcNow - gLastReapply).TotalSeconds;
+            if (sinceLast < gReapplyCooldownSec)
+            {
+                Log(string.Format("cursor lock re-apply SKIPPED ({0:N1}s since last, cooldown {1:N0}s)", sinceLast, gReapplyCooldownSec));
+            }
+            else
+            {
+                RECT r = gSavedClip;
+                if (ClipCursorRect(ref r))
+                {
+                    gLastReapply = DateTime.UtcNow;
+                    gReapplyCount++;
+                    Log(string.Format("RE-APPLIED cursor lock {0} (#{1})", RectStr(r), gReapplyCount));
+                }
+                else Log(string.Format("ClipCursor failed err={0}", Marshal.GetLastWin32Error()));
+            }
+        }
+        else if (returning && !realReturn && lockedBefore && !clipped)
+        {
+            Log(string.Format("cursor lock re-apply SKIPPED (away only {0:N0}ms - foreground flip, not a real return)",
+                (DateTime.UtcNow - gLeftDnAt).TotalMilliseconds));
         }
 
         gLastFgWasDn = fgIsDn;
@@ -752,7 +783,7 @@ static class InertiaNative
         Log(string.Format("start  LongPressMs={0} ShortDec=0x{1:X2} ResetAfterMs={2} LogOnly={3}",
             gLongPress, gShortDec, gResetAfter, gLogOnly));
         Log("RESTB=" + Hex(gRest) + "   ZEROB=" + Hex(gZero));
-        if (gCursorLock) Log("cursor-lock watchdog ON (F11 fullscreen + F8 mouse lock)");
+        if (gCursorLock) Log("cursor-lock watchdog ON (EXPERIMENTAL - see REFERENCE.md; if F8 stops locking, reinstall without -CursorLock)");
         EnsureTarget();
         if (gHandle != IntPtr.Zero) ConfirmSite();
 

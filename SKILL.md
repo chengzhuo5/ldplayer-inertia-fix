@@ -7,10 +7,10 @@ description: 修复雷电模拟器(LDPlayer)右键行走的两个体验问题：
 
 两个独立的问题，一个常驻代理同时解决：
 
-| 问题 | 机制 | 修复 |
-|---|---|---|
-| 松开右键后角色**还在滑**（惯性不可控） | `dnplycore.dll` 的移动逻辑松手后**不把虚拟摇杆归零**，而是每步减 16 直到减到 0 | 4 字节内存补丁，**单击**用 −1（≈16 倍滑步）、**长按**松手直接清零 |
-| F11 全屏 + **F8 锁定鼠标**，Alt+Tab 切走点一下再切回就锁不住 | F8 用的是**桌面级共享**的 `ClipCursor()`；切走时被释放/覆盖，雷电自己不再重设 | 记住雷电自己的裁剪矩形，切回容器时**原样写回** |
+| 问题 | 机制 | 修复 | 状态 |
+|---|---|---|---|
+| 松开右键后角色**还在滑**（惯性不可控） | `dnplycore.dll` 的移动逻辑松手后**不把虚拟摇杆归零**，而是每步减 16 直到减到 0 | 4 字节内存补丁，**单击**用 −1（≈16 倍滑步）、**长按**松手直接清零 | ✅ 稳定，默认启用 |
+| F11 全屏 + **F8 锁定鼠标**，Alt+Tab 切走点一下再切回就锁不住 | F8 用的是**桌面级共享**的 `ClipCursor()`；切走时被释放/覆盖，雷电自己不再重设 | 记住雷电自己的裁剪矩形，切回容器时**原样写回** | ⚠️ **实验性，默认关闭**（见下） |
 
 ## 快速开始
 
@@ -24,7 +24,7 @@ cd <本目录>\scripts
 .\inertia-native.exe --selftest --result selftest.txt
 
 # 2. 安装计划任务（需要提权，用自带的 elev.ps1）
-.\elev.ps1 -Script .\install-inertia-task.ps1 -ScriptArgs '-Engine','exe','-CursorLock'
+.\elev.ps1 -Script .\install-inertia-task.ps1 -ScriptArgs '-Engine','exe'
 
 # 3. 看状态
 .\install-inertia-task.ps1 -Status
@@ -34,7 +34,29 @@ cd <本目录>\scripts
 ```
 
 装好后：**单击右键**保留超长惯性；**长按右键约 0.3 秒以上再松手**立刻停。
-F11 + F8 锁定后，Alt+Tab 来回切不再需要点容器外面。
+
+## ⚠️ F8 鼠标锁定看门狗（实验性，默认关闭）
+
+**默认不要开。** 打开方式是在安装参数里加 `-CursorLock`：
+
+```powershell
+.\elev.ps1 -Script .\install-inertia-task.ps1 -ScriptArgs '-Engine','exe','-CursorLock'
+```
+
+**已知风险**：`ClipCursor` 是**整个桌面共享**的全局状态。如果代理补得太勤，
+会和雷电自己的 F8 开关状态打架 —— **实测出现过「F8 完全锁不住」的回归**，
+比它想修的原 bug（切回来要点一下容器外面）更严重。所以现在：
+
+- 默认**关闭**
+- 只有在容器**真的离开过 ≥ 400ms** 且**距上次补 ≥ 5 秒**时才补一次
+- 每次决策都会写日志（`RE-APPLIED` / `SKIPPED (...)`），便于定位
+- 一旦发现 F8 不正常，**去掉 `-CursorLock` 重装即可立刻恢复**
+
+诊断（会记录每次前台窗口/裁剪区变化）：
+
+```powershell
+.\elev.ps1 -Script .\install-inertia-task.ps1 -ScriptArgs '-Engine','exe','-CursorLock','-ClipDebug'
+```
 
 ## 常见调参
 
