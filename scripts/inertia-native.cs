@@ -25,6 +25,7 @@
 //   inertia-native.exe --seconds 20           exit after N seconds (testing)
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -81,6 +82,8 @@ static class InertiaNative
 
     [DllImport("user32.dll")]
     static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern int GetWindowTextW(IntPtr hWnd, StringBuilder s, int nMaxCount);
     [DllImport("user32.dll")]
     static extern bool GetClipCursor(out RECT r);
     [DllImport("user32.dll", EntryPoint = "ClipCursor")]
@@ -126,6 +129,7 @@ static class InertiaNative
     static bool gLogOnly = false;
     static bool gVerbose = false;
     static bool gStop = false;
+    static Timer gExitTimer = null;                     // rooted, see Main
     static bool gProbe = false;
     static int gProbeCount = 0;
 
@@ -138,6 +142,8 @@ static class InertiaNative
     // re-applies that exact rect the moment the container becomes foreground again.
     static bool gCursorLock = false;
     static bool gClipDebug = false;
+    static bool gFgWatch = false;                       // log every foreground change
+    static int gLastFgWatchPid = -1;
     static bool gLastFgWasDn = false;
     static bool gWasLocked = false;
     static bool gHaveSavedClip = false;
@@ -187,6 +193,32 @@ static class InertiaNative
     static readonly int[] SIGDELTA = { 5, 5, 0 };
 
     // ---------------- logging ----------------
+    // The mouse hook runs on the SYSTEM INPUT CRITICAL PATH.  Anything slow in
+    // the callback (disk I/O above all) delays or drops input for every app, and
+    // past LowLevelHooksTimeout (default 300ms) Windows silently removes the hook.
+    // So the hook path only ever ENQUEUES; the housekeeping thread does the I/O.
+    static readonly ConcurrentQueue<string> gLogQueue = new ConcurrentQueue<string>();
+
+    static void LogAsync(string m)
+    {
+        gLogQueue.Enqueue(string.Format("[{0:HH:mm:ss.fff}] {1}", DateTime.Now, m));
+    }
+
+    static void DrainLog()
+    {
+        if (gLogQueue.IsEmpty) return;
+        StringBuilder sb = new StringBuilder();
+        string line;
+        while (gLogQueue.TryDequeue(out line)) sb.AppendLine(line);
+        string text = sb.ToString();
+        try { Console.Write(text); } catch { }
+        try
+        {
+            lock (gLogLock) { File.AppendAllText(gLogPath, text, Encoding.UTF8); }
+        }
+        catch { }
+    }
+
     static void Log(string m)
     {
         string line = string.Format("[{0:HH:mm:ss.fff}] {1}", DateTime.Now, m);
@@ -479,22 +511,23 @@ static class InertiaNative
         return true;
     }
 
+    // Called from the mouse hook - must never do I/O, so every message is queued.
     static void WriteVariant(byte[] b, string who)
     {
         lock (gMemLock)
         {
-            if (gHandle == IntPtr.Zero || gBase == 0 || gRva == 0) { Log("  (" + who + ") no target"); return; }
+            if (gHandle == IntPtr.Zero || gBase == 0 || gRva == 0) { LogAsync("  (" + who + ") no target"); return; }
             if (!gVerified)
             {
                 byte[] live = Read4(gBase + gRva);
-                if (!TestKnown(live)) { Log("  (" + who + ") SKIPPED - site not verified"); return; }
+                if (!TestKnown(live)) { LogAsync("  (" + who + ") SKIPPED - site not verified"); return; }
                 gVerified = true;
-                Log("  (" + who + ") site re-verified");
+                LogAsync("  (" + who + ") site re-verified");
             }
             IntPtr written;
             bool ok = WriteProcessMemory(gHandle, (IntPtr)(gBase + gRva), b, 4, out written);
-            if (!ok) Log(string.Format("  ({0}) WRITE FAILED err={1}", who, Marshal.GetLastWin32Error()));
-            else Log(string.Format("  ({0}) wrote {1}", who, Hex(b)));
+            if (!ok) LogAsync(string.Format("  ({0}) WRITE FAILED err={1}", who, Marshal.GetLastWin32Error()));
+            else LogAsync(string.Format("  ({0}) wrote {1}", who, Hex(b)));
         }
     }
 
@@ -503,37 +536,48 @@ static class InertiaNative
 
     static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
-        if (nCode >= 0)
+        long t0 = Stopwatch.GetTimestamp();
+        try
         {
-            int msg = wParam.ToInt32();
-            if (gProbe)
+            if (nCode >= 0)
             {
-                // Prove the hook is live without touching any button state:
-                // log whatever comes through (mouse moves included) and bail out.
-                gProbeCount++;
-                Log(string.Format("PROBE event #{0} msg=0x{1:X4}", gProbeCount, msg));
-                if (gProbeCount >= 6) { gStop = true; PostQuit(); }
-                return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
-            }
-            if (msg == WM_RBUTTONDOWN)
-            {
-                gDown = true; gDownAt = DateTime.UtcNow; gNeedReset = false;
-                if (!gLogOnly) WriteVariant(gRest, "on-down");
-                if (gVerbose) Log("RBUTTON DOWN");
-            }
-            else if (msg == WM_RBUTTONUP)
-            {
-                double held = (DateTime.UtcNow - gDownAt).TotalMilliseconds;
-                gDown = false; gUpAt = DateTime.UtcNow;
-                bool isLong = held >= gLongPress;
-                if (!gLogOnly)
+                int msg = wParam.ToInt32();
+                if (gProbe)
                 {
-                    if (isLong) { WriteVariant(gZero, "on-up-long"); gNeedReset = true; }
-                    else { WriteVariant(gRest, "on-up-short"); gNeedReset = false; }
+                    // Prove the hook is live without touching any button state:
+                    // log whatever comes through (mouse moves included) and bail out.
+                    gProbeCount++;
+                    LogAsync(string.Format("PROBE event #{0} msg=0x{1:X4}", gProbeCount, msg));
+                    if (gProbeCount >= 6) { gStop = true; PostQuit(); }
+                    return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
                 }
-                Log(string.Format("RBUTTON UP   held={0:N0}ms  -> {1}", held, isLong ? "ZERO (kill glide)" : "REST (keep glide)"));
+                if (msg == WM_RBUTTONDOWN)
+                {
+                    gDown = true; gDownAt = DateTime.UtcNow; gNeedReset = false;
+                    if (!gLogOnly) WriteVariant(gRest, "on-down");
+                    if (gVerbose) LogAsync("RBUTTON DOWN");
+                }
+                else if (msg == WM_RBUTTONUP)
+                {
+                    double held = (DateTime.UtcNow - gDownAt).TotalMilliseconds;
+                    gDown = false; gUpAt = DateTime.UtcNow;
+                    bool isLong = held >= gLongPress;
+                    if (!gLogOnly)
+                    {
+                        if (isLong) { WriteVariant(gZero, "on-up-long"); gNeedReset = true; }
+                        else { WriteVariant(gRest, "on-up-short"); gNeedReset = false; }
+                    }
+                    LogAsync(string.Format("RBUTTON UP   held={0:N0}ms  -> {1}", held, isLong ? "ZERO (kill glide)" : "REST (keep glide)"));
+                }
             }
         }
+        catch { }
+
+        // Anything slow here delays input for EVERY app and can get the hook
+        // silently dropped (LowLevelHooksTimeout, default 300ms).  Shout about it.
+        double ms = (Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency;
+        if (ms > 50) LogAsync(string.Format("SLOW hook callback: {0:N1}ms (input stalls; Windows drops hooks past ~300ms)", ms));
+
         return CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
     }
 
@@ -632,6 +676,27 @@ static class InertiaNative
         gLastFgWasDn = fgIsDn;
     }
 
+    // ---------------- foreground watcher (who steals focus?) ----------------
+    static void FgWatchTick()
+    {
+        IntPtr fg = GetForegroundWindow();
+        uint fgPid = 0;
+        if (fg != IntPtr.Zero) GetWindowThreadProcessId(fg, out fgPid);
+        int p = (int)fgPid;
+        if (p == gLastFgWatchPid) return;
+        gLastFgWatchPid = p;
+
+        string name = "?";
+        try { name = Process.GetProcessById(p).ProcessName; } catch { }
+
+        StringBuilder title = new StringBuilder(300);
+        try { GetWindowTextW(fg, title, title.Capacity); } catch { }
+
+        string t = title.ToString();
+        if (t.Length > 90) t = t.Substring(0, 90) + "...";
+        Log(string.Format("FOCUS -> {0} (pid {1})  title=\"{2}\"", name, p, t));
+    }
+
     static void Housekeeping()
     {
         int tick = 0;
@@ -643,6 +708,8 @@ static class InertiaNative
                 if (gHandle != IntPtr.Zero && !gVerified) ConfirmSite();
                 MaybeReset();
                 if (gCursorLock) CursorLockTick();
+                if (gFgWatch) FgWatchTick();
+                DrainLog();          // the hook thread only enqueues - all I/O happens here
             }
             catch { }
             tick++;
@@ -730,6 +797,7 @@ static class InertiaNative
                 else if (a == "--probe") { gProbe = true; gLogOnly = true; if (gSeconds == 0) gSeconds = 10; }
                 else if (a == "--cursorlock") gCursorLock = true;
                 else if (a == "--clipdebug") gClipDebug = true;
+                else if (a == "--fgwatch") gFgWatch = true;
                 else if (a == "--log") gLogPath = args[++i];
                 else if (a == "--result") gResultPath = args[++i];
                 else if (a == "--dll") gDllPath = args[++i];
@@ -758,6 +826,7 @@ static class InertiaNative
             gLongPress, gShortDec, gResetAfter, gLogOnly));
         Log("RESTB=" + Hex(gRest) + "   ZEROB=" + Hex(gZero));
         if (gCursorLock) Log("cursor-lock watchdog ON (F11 fullscreen + F8 mouse lock)");
+        if (gFgWatch) Log("foreground watcher ON (logs every focus change)");
         EnsureTarget();
         if (gHandle != IntPtr.Zero) ConfirmSite();
 
@@ -778,7 +847,10 @@ static class InertiaNative
 
         if (gSeconds > 0)
         {
-            Timer t = new Timer(delegate(object o) { gStop = true; PostQuit(); }, null, gSeconds * 1000, Timeout.Infinite);
+            // MUST stay rooted in a static field: a local System.Threading.Timer
+            // is eligible for GC, and once collected its callback never fires
+            // (that is why --seconds appeared to hang).
+            gExitTimer = new Timer(delegate(object o) { gStop = true; PostQuit(); }, null, gSeconds * 1000, Timeout.Infinite);
         }
 
         MSG msg;
@@ -790,6 +862,7 @@ static class InertiaNative
 
         gStop = true;
         UnhookWindowsHookEx(hook);
+        DrainLog();
         CloseTarget();
         Log("stopped");
         return 0;

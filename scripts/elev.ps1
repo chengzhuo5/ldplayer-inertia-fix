@@ -33,8 +33,13 @@ $wf = Join-Path $env:TEMP ('elev_' + [guid]::NewGuid().ToString('N') + '.ps1')
 Set-Content -LiteralPath $wf -Value $wrapper -Encoding ASCII
 
 try {
-    $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -PassThru `
-            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $wf)
+    # -WindowStyle Hidden is passed BOTH to Start-Process and to powershell.exe:
+    # with -Verb RunAs the Start-Process switch is not always honoured, but the
+    # child's own -WindowStyle switch reliably hides its console.  Without this
+    # every elevated call pops up a blank "Administrator: Windows PowerShell"
+    # window (blank because the wrapper redirects all output to a log file).
+    $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -PassThru -WindowStyle Hidden `
+            -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $wf)
     if (-not $p.WaitForExit($TimeoutSec * 1000)) {
         Write-Host "elevated process still running after ${TimeoutSec}s (pid $($p.Id))" -ForegroundColor Yellow
     } else {
