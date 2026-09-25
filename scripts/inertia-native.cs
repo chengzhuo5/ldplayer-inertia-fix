@@ -82,6 +82,8 @@ static class InertiaNative
 
     [DllImport("user32.dll")]
     static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")]
+    static extern bool GetCursorPos(out POINT p);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     static extern int GetWindowTextW(IntPtr hWnd, StringBuilder s, int nMaxCount);
     [DllImport("user32.dll")]
@@ -146,6 +148,22 @@ static class InertiaNative
     static bool gClipDebug = false;
     static bool gFgWatch = false;                       // log every foreground change
     static int gLastFgWatchPid = -1;
+
+    // ---- hook liveness -------------------------------------------------------
+    // Windows SILENTLY removes a low-level hook whose callback exceeds
+    // LowLevelHooksTimeout (default 300ms).  When that happens the agent keeps
+    // running and keeps logging, but never sees another mouse event - the byte
+    // stays frozen at whatever it was last set to, so the two-tier behaviour
+    // dies silently.  That is exactly what happened: stalls of 390/407/4500ms,
+    // then no events for over an hour, with the byte stuck at REST.
+    static IntPtr gHook = IntPtr.Zero;
+    // int (not DateTime) so the hook thread's write is atomic and costs almost
+    // nothing - this runs on every single mouse event, moves included.
+    static volatile int gLastHookEventTick = 0;
+    static POINT gLastCursorPos;
+    static bool gHaveLastCursorPos = false;
+    static DateTime gLastReinstall = DateTime.MinValue;
+    static int gReinstallCount = 0;
     static bool gLastFgWasDn = false;
     static bool gWasLocked = false;
     static bool gHaveSavedClip = false;
@@ -158,6 +176,7 @@ static class InertiaNative
 
     static byte[] gRest;      // quick-click encoding
     static byte[] gZero;      // long-press encoding
+    static byte[] gOrig;      // stock encoding - used as the safe resting state
     static int gRva = 0;
     static byte[] gDisk4 = null;
     static bool gVerified = false;
@@ -539,6 +558,7 @@ static class InertiaNative
     static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
         long t0 = Stopwatch.GetTimestamp();
+        gLastHookEventTick = Environment.TickCount;
         if (nCode < 0)
         {
             // documented: pass straight through, never inspect
@@ -601,18 +621,49 @@ static class InertiaNative
         gNeedReset = false;
     }
 
-    // Did Windows hand us this event promptly?  MSLLHOOKSTRUCT.time is the tick
-    // at which the event happened; a big gap means OUR thread was blocked, which
-    // stalls input for every app.  Only measured on button events (cheap).
+    // Did Windows hand us this event promptly?  MSLLHOOKSTRUCT.time sits at
+    // offset 16 (POINT pt = 8, mouseData = 4, flags = 4) and holding the tick at
+    // which the event happened; a big gap means OUR thread was blocked, which
+    // stalls input for every app AND eventually gets the hook dropped.
+    // Read it with Marshal.ReadInt32 so the callback allocates nothing.
     static void NoteLatency(IntPtr lParam, string what)
     {
         try
         {
-            MSLLHOOKSTRUCT hs = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
-            uint lat = GetTickCount() - hs.time;
+            uint evtTime = (uint)Marshal.ReadInt32(lParam, 16);
+            uint lat = GetTickCount() - evtTime;
             if (lat > 100) LogAsync(string.Format("LATE input ({0}): delivered {1}ms late - our thread was blocking", what, lat));
         }
         catch { }
+    }
+
+    // ---------------- hook liveness / self-heal ----------------
+    // If the mouse moved but our hook saw nothing, Windows has dropped the hook.
+    // Re-install it and park the byte back to the stock value so the emulator is
+    // never left stuck in "always long glide".
+    static void CheckHookHealth()
+    {
+        POINT cur;
+        if (!GetCursorPos(out cur)) return;
+        bool moved = !gHaveLastCursorPos || cur.x != gLastCursorPos.x || cur.y != gLastCursorPos.y;
+        gLastCursorPos = cur; gHaveLastCursorPos = true;
+        if (!moved) return;
+
+        double sinceEvent = (uint)(Environment.TickCount - gLastHookEventTick);
+        if (sinceEvent < 1000) return;                       // hook is delivering
+        if ((DateTime.UtcNow - gLastReinstall).TotalSeconds < 5) return;   // don't thrash
+
+        gLastReinstall = DateTime.UtcNow;
+        gReinstallCount++;
+        if (gHook != IntPtr.Zero) UnhookWindowsHookEx(gHook);
+        gHook = SetWindowsHookEx(WH_MOUSE_LL, gHookProc, GetModuleHandle(null), 0);
+        Log(string.Format("HOOK RE-INSTALLED (#{0}): mouse moved but no hook event for {1:N0}ms -> Windows had dropped it; new handle={2}",
+            gReinstallCount, sinceEvent, gHook.ToInt64()));
+        if (gHook == IntPtr.Zero) Log(string.Format("  SetWindowsHookEx failed err={0}", Marshal.GetLastWin32Error()));
+
+        // put the emulator back to stock instead of leaving it stuck on REST
+        if (!gLogOnly && gVerified) WriteVariant(gOrig, "hook-loss-reset");
+        gLastHookEventTick = Environment.TickCount;
     }
 
     // ---------------- cursor lock watchdog ----------------
@@ -735,6 +786,7 @@ static class InertiaNative
                 MaybeReset();
                 if (gCursorLock) CursorLockTick();
                 if (gFgWatch) FgWatchTick();
+                CheckHookHealth();   // self-heal if Windows dropped our hook
                 DrainLog();          // the hook thread only enqueues - all I/O happens here
             }
             catch { }
@@ -837,6 +889,7 @@ static class InertiaNative
 
         gRest = new byte[] { 0x83, 0x41, 0x2C, (byte)(gShortDec & 0xFF) };
         gZero = new byte[] { 0x83, 0x61, 0x2C, 0x00 };
+        gOrig = new byte[] { 0x83, 0x41, 0x2C, 0xF0 };   // stock: add ..., -0x10
 
         if (selfTest) return SelfTest();
         if (cycle) return CycleTest();
@@ -861,12 +914,13 @@ static class InertiaNative
         hk.Start();
 
         gHookProc = new HookProc(HookCallback);
-        IntPtr hook = SetWindowsHookEx(WH_MOUSE_LL, gHookProc, GetModuleHandle(null), 0);
-        if (hook == IntPtr.Zero)
+        gHook = SetWindowsHookEx(WH_MOUSE_LL, gHookProc, GetModuleHandle(null), 0);
+        if (gHook == IntPtr.Zero)
         {
             Log(string.Format("SetWindowsHookEx failed err={0}", Marshal.GetLastWin32Error()));
             return 4;
         }
+        gLastHookEventTick = Environment.TickCount;
         Log("mouse hook installed (event driven, no polling)");
 
         gMainThreadId = GetCurrentThreadId();
@@ -887,7 +941,7 @@ static class InertiaNative
         }
 
         gStop = true;
-        UnhookWindowsHookEx(hook);
+        if (gHook != IntPtr.Zero) UnhookWindowsHookEx(gHook);
         DrainLog();
         CloseTarget();
         Log("stopped");
