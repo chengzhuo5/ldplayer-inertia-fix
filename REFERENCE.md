@@ -271,6 +271,54 @@ Hello World 级别的复现：只要调用 `GetConsoleWindow()` 就崩（`GetSys
 
 ---
 
+## 4.11 输入是按会话隔离的 —— 代理可能跑在"没有输入"的会话里 ⚠️⚠️
+
+**整个项目里最难发现的失效模式，因为它不产生任何错误。**
+
+如果同一个用户在系统里同时存在多个会话 —— 最常见的是一个**断开的残留 RDP 会话**
+加上正在用的 console 会话 —— 那么一个 `LogonType Interactive` 的计划任务
+**可能被调度进那个断开的会话**。
+
+| | 会话正确 | 会话错误 |
+|---|---|---|
+| `WH_MOUSE_LL` 钩子 | 正常收事件 | **0 事件** |
+| `GetAsyncKeyState` | 正常 | **恒为 0** |
+| `OpenProcess` + 读写 `dnplayer` 内存 | 正常 | **正常**（跨会话是通的） |
+| 日志 | 正常 | 正常，**一个错误都不报** |
+
+于是现象是「**补丁看起来打上了（`verified=True`、`init wrote`），但游戏里毫无效果**」——
+因为两级切换根本没发生，字节停在最后一次写入的值。
+
+实测证据（同一个 exe、同一时刻）：
+
+```
+session 1 (Disc):  heartbeat sess=1/console=2 hookEvents=0     pollEdges=0
+session 2 (Active): heartbeat sess=2/console=2 hookEvents=4514   pollEdges=110
+```
+
+### 排查时走过的弯路（全都因为没先查会话）
+
+1. 用**非提权**探针测钩子 → 0 事件 → 误判成"钩子坏了"（其实是那个探针权限不够，UIPI）
+2. 怀疑 UIPI → 实测代理和 `dnplayer` 都是 HIGH，**排除**
+3. 怀疑 Raw Input 抑制 / 驱动重映射 → **全 256 键码扫描**证明右键完全正常
+4. 直到对比 `SessionId` 才找到真相
+
+**教训：任何"按会话"的 API 出问题时，第一件事是 `query session`。**
+
+### 正确做法
+
+1. **代理自检会话**：启动时比较 `Process.GetCurrentProcess().SessionId` 与
+   `WTSGetActiveConsoleSessionId()`，不一致就打醒目警告；心跳里也带 `sess=x/console=y`
+2. **持久化别用 `LogonType Interactive` 的计划任务**，改用 **Startup 启动器** ——
+   Startup 项天然运行在交互式 console 会话里，不会有这个问题
+3. 发现有残留会话就 `logoff <id>`（或重启）清掉
+
+> 这个坑不只影响本项目：**任何按会话隔离的东西都会中招** ——
+  低层钩子、`GetAsyncKeyState`、`ClipCursor`、剪贴板、`SetForegroundWindow` 相关的一切。
+  那个"F8 锁定/失焦"类问题反复出现，很可能也有一部分是残留会话造成的。
+
+---
+
 ## 5. 已被推翻的猜测（留档，避免重复走）
 
 | 曾经的结论 | 实际 |

@@ -40,6 +40,7 @@ static class InertiaNative
     const int WH_MOUSE_LL = 14;
     const int WM_RBUTTONDOWN = 0x0204;
     const int WM_RBUTTONUP = 0x0205;
+    const int VK_RB = 0x02;                 // VK_RBUTTON, for GetAsyncKeyState
     const uint TH32CS_SNAPMODULE = 0x00000008;
     const uint TH32CS_SNAPMODULE32 = 0x00000010;
     const uint IMAGE_SCN_MEM_EXECUTE = 0x20000000;
@@ -99,6 +100,14 @@ static class InertiaNative
     [DllImport("user32.dll")]
     static extern bool SetProcessDPIAware();
 
+    [DllImport("user32.dll")]
+    static extern short GetAsyncKeyState(int v);
+    [DllImport("kernel32.dll")]
+    static extern uint WTSGetActiveConsoleSessionId();
+    [DllImport("winmm.dll")]
+    static extern uint timeBeginPeriod(uint ms);
+    [DllImport("winmm.dll")]
+    static extern uint timeEndPeriod(uint ms);
     [DllImport("kernel32.dll")]
     static extern uint GetTickCount();
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
@@ -220,6 +229,17 @@ static class InertiaNative
     // So the hook path only ever ENQUEUES; the housekeeping thread does the I/O.
     static readonly ConcurrentQueue<string> gLogQueue = new ConcurrentQueue<string>();
 
+    // Observability.  Without these the agent is a black box: button lines go
+    // through the async queue, so "no lines in the log" cannot be distinguished
+    // from "queue never drained".  These counters are printed by a heartbeat that
+    // writes DIRECTLY to the file.
+    static long gHookEvents = 0;      // every hook callback, moves included
+    static long gPollEdges = 0;       // button edges the polling path detected
+    static long gDrained = 0;         // queued lines actually written out
+    static volatile int gPollAliveTick = 0;
+    static volatile int gHouseAliveTick = 0;
+    static volatile int gDrainAliveTick = 0;
+
     static void LogAsync(string m)
     {
         gLogQueue.Enqueue(string.Format("[{0:HH:mm:ss.fff}] {1}", DateTime.Now, m));
@@ -227,10 +247,11 @@ static class InertiaNative
 
     static void DrainLog()
     {
+        gDrainAliveTick = Environment.TickCount;
         if (gLogQueue.IsEmpty) return;
         StringBuilder sb = new StringBuilder();
         string line;
-        while (gLogQueue.TryDequeue(out line)) sb.AppendLine(line);
+        while (gLogQueue.TryDequeue(out line)) { sb.AppendLine(line); gDrained++; }
         string text = sb.ToString();
         try { Console.Write(text); } catch { }
         try
@@ -238,6 +259,31 @@ static class InertiaNative
             lock (gLogLock) { File.AppendAllText(gLogPath, text, Encoding.UTF8); }
         }
         catch { }
+    }
+
+    // Dedicated drain thread: if the housekeeping thread ever stalls, queued
+    // button events would otherwise sit in memory forever and the log would look
+    // like "nothing happened" even though detection worked.
+    static void LogDrainLoop()
+    {
+        while (!gStop) { try { DrainLog(); } catch { } Thread.Sleep(200); }
+    }
+
+    // Prints, once per interval, whether every thread is alive and what each
+    // input path has seen.  Written with Log() so it bypasses the queue.
+    static void HeartbeatLoop()
+    {
+        while (!gStop)
+        {
+            Thread.Sleep(10000);
+            if (gStop) break;
+            int now = Environment.TickCount;
+            Log(string.Format(
+                "heartbeat: {0} hookEvents={1} pollEdges={2} drained={3} queued={4} hook={5} verified={6} down={7} | threads: poll={8}ms house={9}ms drain={10}ms ago",
+                SessionTag(), gHookEvents, gPollEdges, gDrained, gLogQueue.Count,
+                gHook != IntPtr.Zero, gVerified, gDown,
+                now - gPollAliveTick, now - gHouseAliveTick, now - gDrainAliveTick));
+        }
     }
 
     static void Log(string m)
@@ -555,10 +601,98 @@ static class InertiaNative
     // ---------------- hook ----------------
     static HookProc gHookProc;   // MUST stay referenced or the GC eats it
 
+    // Both mouse hooks and GetAsyncKeyState are PER SESSION.  If this process
+    // lands in a stale/disconnected session (easy when the same user has both a
+    // leftover RDP session and the console session), it sees no input at all
+    // while still happily patching memory - which looks exactly like "the fix
+    // stopped working" with no error anywhere.  Say so, loudly.
+    static int MySession = -1;
+    static uint ConsoleSession = 0xFFFFFFFF;
+
+    static void CheckSession()
+    {
+        try
+        {
+            MySession = Process.GetCurrentProcess().SessionId;
+            ConsoleSession = WTSGetActiveConsoleSessionId();
+            if (ConsoleSession != 0xFFFFFFFF && MySession != (int)ConsoleSession)
+            {
+                Log(string.Format("!! WRONG SESSION: this agent is in session {0} but the active console session is {1}.", MySession, ConsoleSession));
+                Log("!! Mouse hooks and GetAsyncKeyState are per-session, so this agent sees NO input.");
+                Log("!! Memory patching still works, which is why nothing else looks broken.");
+                Log("!! Fix: log off the stale session (or reboot) and restart the agent.");
+            }
+            else
+            {
+                Log(string.Format("session check OK: session {0} is the active console session", MySession));
+            }
+        }
+        catch { }
+    }
+
+    static string SessionTag()
+    {
+        return string.Format("sess={0}/console={1}", MySession,
+            ConsoleSession == 0xFFFFFFFF ? "?" : ConsoleSession.ToString());
+    }
+
+    // ---------------- shared button edge handling ----------------
+    // Used by BOTH input paths.  gDown is the shared state, so whichever path
+    // sees the edge first acts and the other one sees no change - they dedupe
+    // for free, with no extra bookkeeping.
+    //
+    //   path 1: WH_MOUSE_LL hook   - exact event timing, but Windows can drop it
+    //                                silently, and it is subject to UIPI
+    //   path 2: GetAsyncKeyState   - immune to hook drops, UIPI and raw-input
+    //                                mode; ~2ms sampling with timeBeginPeriod(1)
+    static void HandleButtonEdge(bool down, string src)
+    {
+        if (down)
+        {
+            if (gDown) return;                       // other path already handled it
+            gDown = true; gDownAt = DateTime.UtcNow; gNeedReset = false;
+            if (!gLogOnly) WriteVariant(gRest, "on-down");
+            if (gVerbose) LogAsync("RBUTTON DOWN (" + src + ")");
+        }
+        else
+        {
+            if (!gDown) return;                      // other path already handled it
+            double held = (DateTime.UtcNow - gDownAt).TotalMilliseconds;
+            gDown = false; gUpAt = DateTime.UtcNow;
+            bool isLong = held >= gLongPress;
+            if (!gLogOnly)
+            {
+                if (isLong) { WriteVariant(gZero, "on-up-long"); gNeedReset = true; }
+                else { WriteVariant(gRest, "on-up-short"); gNeedReset = false; }
+            }
+            LogAsync(string.Format("RBUTTON UP   held={0:N0}ms  -> {1}  [{2}]",
+                held, isLong ? "ZERO (kill glide)" : "REST (keep glide)", src));
+        }
+    }
+
+    // Polling path.  Cheap enough in C# that running it always is fine.
+    static void PollButtonLoop()
+    {
+        timeBeginPeriod(1);                              // ~1ms timer, so Sleep(2) is honest
+        try
+        {
+            bool last = false;
+            while (!gStop)
+            {
+                gPollAliveTick = Environment.TickCount;
+                bool down = (GetAsyncKeyState(VK_RB) & 0x8000) != 0;
+                if (down != last) { gPollEdges++; HandleButtonEdge(down, "poll"); last = down; }
+                Thread.Sleep(2);
+            }
+        }
+        finally { timeEndPeriod(1); }
+    }
+
     static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
         long t0 = Stopwatch.GetTimestamp();
         gLastHookEventTick = Environment.TickCount;
+        gHookEvents++;
         if (nCode < 0)
         {
             // documented: pass straight through, never inspect
@@ -577,22 +711,12 @@ static class InertiaNative
             }
             else if (msg == WM_RBUTTONDOWN)
             {
-                gDown = true; gDownAt = DateTime.UtcNow; gNeedReset = false;
-                if (!gLogOnly) WriteVariant(gRest, "on-down");
-                if (gVerbose) LogAsync("RBUTTON DOWN");
+                HandleButtonEdge(true, "hook");
                 NoteLatency(lParam, "down");
             }
             else if (msg == WM_RBUTTONUP)
             {
-                double held = (DateTime.UtcNow - gDownAt).TotalMilliseconds;
-                gDown = false; gUpAt = DateTime.UtcNow;
-                bool isLong = held >= gLongPress;
-                if (!gLogOnly)
-                {
-                    if (isLong) { WriteVariant(gZero, "on-up-long"); gNeedReset = true; }
-                    else { WriteVariant(gRest, "on-up-short"); gNeedReset = false; }
-                }
-                LogAsync(string.Format("RBUTTON UP   held={0:N0}ms  -> {1}", held, isLong ? "ZERO (kill glide)" : "REST (keep glide)"));
+                HandleButtonEdge(false, "hook");
                 NoteLatency(lParam, "up");
             }
         }
@@ -787,6 +911,7 @@ static class InertiaNative
                 if (gCursorLock) CursorLockTick();
                 if (gFgWatch) FgWatchTick();
                 CheckHookHealth();   // self-heal if Windows dropped our hook
+                gHouseAliveTick = Environment.TickCount;
                 DrainLog();          // the hook thread only enqueues - all I/O happens here
             }
             catch { }
@@ -906,12 +1031,18 @@ static class InertiaNative
         Log("RESTB=" + Hex(gRest) + "   ZEROB=" + Hex(gZero));
         if (gCursorLock) Log("cursor-lock watchdog ON (F11 fullscreen + F8 mouse lock)");
         if (gFgWatch) Log("foreground watcher ON (logs every focus change)");
+        CheckSession();
         EnsureTarget();
         if (gHandle != IntPtr.Zero) ConfirmSite();
 
         Thread hk = new Thread(new ThreadStart(Housekeeping));
         hk.IsBackground = true;
         hk.Start();
+
+        Thread poll = new Thread(new ThreadStart(PollButtonLoop));
+        poll.IsBackground = true;
+        poll.Start();
+        Log("button detection: WH_MOUSE_LL hook + GetAsyncKeyState polling (both paths active)");
 
         gHookProc = new HookProc(HookCallback);
         gHook = SetWindowsHookEx(WH_MOUSE_LL, gHookProc, GetModuleHandle(null), 0);
@@ -922,6 +1053,14 @@ static class InertiaNative
         }
         gLastHookEventTick = Environment.TickCount;
         Log("mouse hook installed (event driven, no polling)");
+
+        Thread dr = new Thread(new ThreadStart(LogDrainLoop));
+        dr.IsBackground = true;
+        dr.Start();
+
+        Thread hb = new Thread(new ThreadStart(HeartbeatLoop));
+        hb.IsBackground = true;
+        hb.Start();
 
         gMainThreadId = GetCurrentThreadId();
 

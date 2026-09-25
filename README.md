@@ -65,6 +65,35 @@ cd scripts
 -ScriptArgs '-CursorLock','-ClipDebug'
 ```
 
+## ⚠️ 出问题先看会话
+
+**输入是按 Windows 会话隔离的。** 如果同一用户在系统里有多个会话
+（比如一个断开的残留 RDP 会话 + 正在用的 console 会话），`LogonType Interactive`
+的计划任务**可能被调度进那个没有输入的会话** —— 此时内存补丁照常工作
+（`verified=True`）但**鼠标完全读不到**，看起来就像"补丁失效、游戏里没效果"，而且**一个错误都不报**。
+
+```powershell
+query session                                      # 看有没有残留会话（Disc 状态的那种）
+Get-Process inertia-native | Select-Object Id,SessionId
+Get-Content <安装目录>\inertia-native.log -Tail 5   # 心跳
+```
+
+代理现在会自己检测并警告：
+
+```
+!! WRONG SESSION: this agent is in session 1 but the active console session is 2.
+```
+
+正常心跳应该 `sess` 等于 `console`，且 `hookEvents` 在持续增长：
+
+```
+heartbeat: sess=2/console=2 hookEvents=36500 pollEdges=110 drained=166 queued=0
+           hook=True verified=True down=False | threads: poll=0ms house=0ms drain=0ms ago
+```
+
+**所以本项目的持久化用 Startup 启动器，而不是计划任务** —— Startup 项天然运行在
+交互式 console 会话里。详见 [REFERENCE.md](REFERENCE.md) §4.11。
+
 ## 特性
 
 - **CPU ≈ 0%** —— 用 `WH_MOUSE_LL` 低层鼠标钩子事件驱动，不轮询（PowerShell 版是 4ms 轮询，约 22% 单核）
