@@ -139,6 +139,7 @@ static class InertiaNative
     static int gShortDec = 0xFF;
     static int gResetAfter = 1500;
     static int gSeconds = 0;
+    static int gHeartbeatSec = 60;    // 0 disables; 10 is handy while debugging
     static bool gLogOnly = false;
     static bool gVerbose = false;
     static bool gStop = false;
@@ -245,9 +246,37 @@ static class InertiaNative
         gLogQueue.Enqueue(string.Format("[{0:HH:mm:ss.fff}] {1}", DateTime.Now, m));
     }
 
+    // Runtime log rotation.  The agent is meant to run for weeks (Startup
+    // launcher), so a startup-only size check is not enough - the heartbeat alone
+    // adds thousands of lines per day.  Checked at most once a minute from the
+    // drain thread; keeps the tail so recent context survives.
+    const long LogCapBytes = 2L * 1024 * 1024;
+    const int LogKeepLines = 1000;
+    static int gLastRotateCheck = 0;
+
+    static void MaybeRotateLog()
+    {
+        int now = Environment.TickCount;
+        if (gLastRotateCheck != 0 && (uint)(now - gLastRotateCheck) < 60000) return;
+        gLastRotateCheck = now;
+        try
+        {
+            FileInfo fi = new FileInfo(gLogPath);
+            if (!fi.Exists || fi.Length < LogCapBytes) return;
+            string[] lines = File.ReadAllLines(gLogPath);
+            int keep = Math.Min(lines.Length, LogKeepLines);
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("--- log rotated (was " + (fi.Length / 1024) + " KB, kept last " + keep + " lines) ---");
+            for (int i = lines.Length - keep; i < lines.Length; i++) sb.AppendLine(lines[i]);
+            lock (gLogLock) { File.WriteAllText(gLogPath, sb.ToString(), Encoding.UTF8); }
+        }
+        catch { }
+    }
+
     static void DrainLog()
     {
         gDrainAliveTick = Environment.TickCount;
+        MaybeRotateLog();
         if (gLogQueue.IsEmpty) return;
         StringBuilder sb = new StringBuilder();
         string line;
@@ -271,11 +300,14 @@ static class InertiaNative
 
     // Prints, once per interval, whether every thread is alive and what each
     // input path has seen.  Written with Log() so it bypasses the queue.
+    // Default 60s: this is a long-running background agent, and a 10s heartbeat
+    // means ~8600 lines/day of noise.  --heartbeat 10 while debugging.
     static void HeartbeatLoop()
     {
         while (!gStop)
         {
-            Thread.Sleep(10000);
+            if (gHeartbeatSec <= 0) { Thread.Sleep(Timeout.Infinite); return; }
+            Thread.Sleep(gHeartbeatSec * 1000);
             if (gStop) break;
             int now = Environment.TickCount;
             Log(string.Format(
@@ -1001,6 +1033,7 @@ static class InertiaNative
                 else if (a == "--cursorlock") gCursorLock = true;
                 else if (a == "--clipdebug") gClipDebug = true;
                 else if (a == "--fgwatch") gFgWatch = true;
+                else if (a == "--heartbeat") gHeartbeatSec = int.Parse(args[++i]);
                 else if (a == "--log") gLogPath = args[++i];
                 else if (a == "--result") gResultPath = args[++i];
                 else if (a == "--dll") gDllPath = args[++i];
